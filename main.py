@@ -263,4 +263,5 @@ if __name__ == "__main__":
     token = os.getenv("DISCORD_BOT_TOKEN")
     if not token:
         raise RuntimeError("DISCORD_BOT_TOKEN не знайдено")
+    print("DEBUG TEST_GUILD_ID =", TEST_GUILD_ID)
     bot.run(token)
