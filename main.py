@@ -54,8 +54,6 @@ async def extract_info(query: str) -> Optional[dict]:
                 "Chrome/124.0.0.0 Safari/537.36"
             )
         },
-        "cookiesfrombrowser": "chrome" if COOKIES_PATH is None else None,
-        "cookiefile": COOKIES_PATH,
         "ignoreerrors": True,
     }
 
