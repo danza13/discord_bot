@@ -1,292 +1,287 @@
-# Файл: main.py
+#!/usr/bin/env python
+# ──────────────────────────────────────────────────────────────
+# Discord‑бот‑програвач «під ключ» (discord.py 2.5.x + yt‑dlp)
+# Працює у Native Run‑time Render без apt‑get та без Docker
+# ──────────────────────────────────────────────────────────────
+#  ⚙  Встановіть залежності (requirements.txt):
+#      discord.py[voice]==2.5.2
+#      yt-dlp>=2025.04  # свіжа версія з патчем проти HTTP 429
+#      PyNaCl>=1.5
+#
+#  🔑  У Render → Environment:
+#      DISCORD_BOT_TOKEN   = <токен>
+#      YTDLP_COOKIES_FILE  = youtube_cookies.txt   (необов’язково)
+#      ENABLE_MSG_CONTENT  = false                 (true, якщо потрібні !префікс‑команди)
+#
+#  🛑  У Discord Dev Portal на сторінці бота увімкніть:
+#      • MESSAGE CONTENT INTENT (лише коли потрібно) та натисніть Save.
+#
+#  🚀  Build Command:  pip install -r requirements.txt
+# ──────────────────────────────────────────────────────────────
 
-import os
 import asyncio
-import discord
-from discord.ext import commands
-from discord import app_commands
+import os
+import traceback
+from typing import Dict, List, Optional
 
+import discord
+from discord import app_commands
+from discord.ext import commands
 import yt_dlp
 
-# Переконайтесь, що у вас встановлено:
-# pip install py-cord
-# pip install yt-dlp
-# pip install PyNaCl
+# ╭─╴ Конфігурація ────────────────────────────────────────────╮
+MAX_DEFER_SECONDS = 2.5          # скільки «думаємо» до першої відповіді
+TEST_GUILD_ID = int(os.getenv("TEST_GUILD_ID", "0"))  # миттєва реєстрація Slash‑команд
+COOKIES_PATH = os.getenv("YTDLP_COOKIES_FILE")        # файл із cookie — прибирає 429
+ENABLE_MSG_CONTENT = os.getenv("ENABLE_MSG_CONTENT", "false").lower() == "true"
+# ╰─────────────────────────────────────────────────────────────╯
 
-# Інструмент для отримання аудіо потоку з посилання за допомогою yt-dlp
-# Повертає (title, duration, source_url, webpage_url)
-async def extract_info(url: str):
+
+# ╭─╴ yt‑dlp: єдина точка входу ───────────────────────────────╮
+async def extract_info(url_or_query: str) -> Optional[dict]:
+    """Повертає InfoDict або None. Обробляє HTTP 429 та DRM."""
     ydl_opts = {
-        'format': 'bestaudio/best',
-        'quiet': True,
-        'noplaylist': True,
-        'default_search': 'auto',  # якщо користувач введе не URL, а просто запит
-        'ignoreerrors': True
+        "format": "bestaudio/best",
+        "quiet": True,
+        "noplaylist": True,
+        "default_search": "ytsearch",
+        "source_address": "0.0.0.0",          # кеш обходу rate‑limit
+        "http_headers": {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0.0.0 Safari/537.36"
+            )
+        },
+        "cookiesfrombrowser": "chrome" if COOKIES_PATH is None else None,
+        "cookiefile": COOKIES_PATH,
+        "ignoreerrors": True,
     }
 
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = await loop.run_in_executor(None, lambda: ydl.extract_info(url, download=False))
-    
-    if info is None:
+        try:
+            info = await loop.run_in_executor(
+                None, lambda: ydl.extract_info(url_or_query, download=False)
+            )
+        except yt_dlp.utils.DownloadError as e:
+            print(f"[yt‑dlp] помилка: {e}")
+            return None
+
+    if not info:
         return None
 
-    # Якщо користувач дав плейлист, беремо перший трек
-    if 'entries' in info:
-        info = info['entries'][0]
+    # Перший елемент плейлиста / пошуку
+    if "entries" in info:
+        info = next((e for e in info["entries"] if e), None)
 
-    # Витягуємо дані
-    title = info.get('title', 'Untitled')
-    duration = info.get('duration', 0)
-    webpage_url = info.get('webpage_url', url)
-    # Аудіо-потік
-    url_audio = info['url']
-    
-    return (title, duration, url_audio, webpage_url)
+    # DRM — відкидаємо
+    if info and info.get("drm") is True:
+        return None
+    return info
 
+
+# ╭─╴ Модель треку та плеєр для кожного Guild ────────────────╮
 class Song:
-    def __init__(self, title, duration, source_url, webpage_url):
-        self.title = title
-        self.duration = duration
-        self.source_url = source_url
-        self.webpage_url = webpage_url
+    def __init__(self, info: dict):
+        self.title = info.get("title", "Untitled")
+        self.duration = int(info.get("duration", 0))
+        self.source_url = info["url"]
+        self.webpage_url = info.get("webpage_url")
 
-    def __str__(self):
-        return f"{self.title} ({self.duration_str()})"
-
-    def duration_str(self):
-        # Перетворення тривалості у формат хв:сек
+    def __str__(self) -> str:
         m, s = divmod(self.duration, 60)
-        return f"{int(m)}:{s:02d}"
+        return f"{self.title} ({m}:{s:02d})"
+
 
 class MusicPlayer:
     def __init__(self):
-        self.queue = []
-        self.current_song = None
-        self.voice_client = None
+        self.queue: List[Song] = []
+        self.current: Optional[Song] = None
+        self.voice: Optional[discord.VoiceClient] = None
         self.is_paused = False
-    
-    def add_to_queue(self, song: Song):
+
+    # утиліти
+    def enqueue(self, song: Song) -> int:
         self.queue.append(song)
         return len(self.queue)
 
-    def skip_song(self):
-        if self.voice_client and self.voice_client.is_playing():
-            self.voice_client.stop()
+    def next(self):
+        self.current = self.queue.pop(0) if self.queue else None
 
-    def stop(self):
-        self.queue.clear()
-        self.current_song = None
-        if self.voice_client and self.voice_client.is_connected():
-            asyncio.create_task(self.voice_client.disconnect())
-
-    def pause(self):
-        if self.voice_client:
-            if self.voice_client.is_playing() and not self.is_paused:
-                self.voice_client.pause()
-                self.is_paused = True
-            elif self.is_paused:
-                self.voice_client.resume()
-                self.is_paused = False
-
-    def remove_song(self, index: int):
-        if 0 <= index < len(self.queue):
-            self.queue.pop(index)
-            return True
-        return False
+    def disconnect(self):
+        if self.voice and self.voice.is_connected():
+            coro = self.voice.disconnect()
+            asyncio.create_task(coro)
 
 
-# Мапа для кожного сервера (guild), щоб зберігати власну чергу 
-# (можливо, знадобиться створювати окремі MusicPlayer для кожного guild)
-music_players = {}
+players: Dict[int, MusicPlayer] = {}
 
 
+def get_player(guild: discord.Guild) -> MusicPlayer:
+    if guild.id not in players:
+        players[guild.id] = MusicPlayer()
+    return players[guild.id]
+
+
+# ╭─╴ Intents та ініціалізація бота ───────────────────────────╮
 intents = discord.Intents.default()
-intents.message_content = True  # Щоб бот міг читати вміст повідомлень, якщо треба
-bot = commands.Bot(command_prefix="!", intents=intents)
+intents.message_content = ENABLE_MSG_CONTENT
+bot = commands.Bot(command_prefix="!" if ENABLE_MSG_CONTENT else commands.when_mentioned, intents=intents)
 
-# Реєструємо "Guild Commands" або "Global Commands"
-# Для зручності зробимо так, щоб Slash-команди були доступні глобально
-# Якщо ж потрібно робити лише для певних серверів, використовуйте: @bot.tree.command(guild=discord.Object(id=ВАШ_GUILD_ID))
+
 @bot.event
 async def on_ready():
-    print(f"Бот запустився як {bot.user}")
+    print(f"✅ Увійшла як {bot.user} | Гільдї: {len(bot.guilds)}")
     try:
-        synced = await bot.tree.sync()
-        print(f"Slash команди синхронізовані! {len(synced)} команд.")
+        if TEST_GUILD_ID:
+            test = discord.Object(id=TEST_GUILD_ID)
+            bot.tree.copy_global_to(guild=test)
+            await bot.tree.sync(guild=test)
+            print("🔄 Slash‑команди синхронізовані для TEST_GUILD_ID")
+        else:
+            synced = await bot.tree.sync()
+            print(f"🔄 Slash‑команди глобально синхронізовані: {len(synced)}")
     except Exception as e:
-        print(f"Помилка синхронізації: {e}")
-
-def get_player(guild_id: int) -> MusicPlayer:
-    if guild_id not in music_players:
-        music_players[guild_id] = MusicPlayer()
-    return music_players[guild_id]
+        print("❌ Sync error:", e)
 
 
-@bot.tree.command(name="play", description="Відтворити/додати пісню в чергу за посиланням (YouTube, SoundCloud тощо).")
-@app_commands.describe(url="Посилання або пошуковий запит (для YouTube тощо).")
-async def play_command(interaction: discord.Interaction, url: str):
-    await interaction.response.defer()  # повідомимо Discord, що бот "думає"
+# ╭─╴ Головні Slash‑команди ──────────────────────────────────╮
+@app_commands.command(name="play", description="Відтворити або додати трек")
+@app_commands.describe(url="URL або пошуковий запит")
+async def play_cmd(inter: discord.Interaction, url: str):
+    await inter.response.send_message("⏳ Завантажую трек…")
+    msg = await inter.original_response()
 
-    guild_id = interaction.guild_id
-    player = get_player(guild_id)
+    # Перевірка Voice‑стану
+    if not (vs := inter.user.voice) or not vs.channel:
+        return await msg.edit(content="❌ Спочатку зайдіть у голосовий канал.")
 
-    # 1. Отримати голосовий канал користувача
-    voice_state = interaction.user.voice
-    if not voice_state or not voice_state.channel:
-        await interaction.followup.send("Спочатку потрібно зайти в голосовий канал!", ephemeral=True)
-        return
+    player = get_player(inter.guild)
+    if not player.voice or not player.voice.is_connected():
+        player.voice = await vs.channel.connect()
+    elif player.voice.channel.id != vs.channel.id:
+        await player.voice.move_to(vs.channel)
 
-    # 2. Перевірити, чи бот уже в голосовому каналі
-    voice_client = player.voice_client
-    if not voice_client or not voice_client.is_connected():
-        # Підключитись до голосового каналу користувача
-        player.voice_client = await voice_state.channel.connect()
-    else:
-        # Якщо бот підключений до іншого каналу, треба перевірити, чи це той самий
-        if voice_client.channel.id != voice_state.channel.id:
-            await voice_client.move_to(voice_state.channel)
-
-    # 3. Завантажити інформацію про трек
     info = await extract_info(url)
-    if info is None:
-        await interaction.followup.send("Не вдалося знайти або відтворити дане посилання.", ephemeral=True)
-        return
+    if not info:
+        return await msg.edit(content="❌ Не вдалося отримати аудіо (DRM, 429 чи неправильне посилання).")
 
-    title, duration, source_url, webpage_url = info
-    new_song = Song(title, duration, source_url, webpage_url)
-
-    # 4. Якщо нічого зараз не грає, граємо одразу
-    if not player.voice_client.is_playing() and not player.is_paused:
-        player.current_song = new_song
-        await start_playing(interaction, player)
+    song = Song(info)
+    # Якщо нічого не грає
+    if not player.voice.is_playing() and not player.is_paused and player.current is None:
+        player.current = song
+        await _start_playback(player, inter)
+        await msg.edit(content=f"▶️ Зараз грає: **{song}**")
     else:
-        # Інакше додаємо у чергу
-        position = player.add_to_queue(new_song)
-        await interaction.followup.send(f"Додано в чергу: {new_song}\nПозиція у черзі: {position}")
-    
+        pos = player.enqueue(song)
+        await msg.edit(content=f"➕ Додано в чергу під № {pos}: **{song.title}**")
 
-async def start_playing(interaction: discord.Interaction, player: MusicPlayer):
-    """Функція, яка розпочинає відтворення треку та обробляє перехід до наступних."""
-    if not player.current_song:
+
+async def _start_playback(player: MusicPlayer, inter: discord.Interaction):
+    if not player.current:
         return
 
-    source = discord.FFmpegPCMAudio(player.current_song.source_url, 
-                                    before_options="-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5", 
-                                    options="-vn")
-    
-    def after_playing(err):
-        if err:
-            print(f"Помилка відтворення: {err}")
-        # Після закінчення поточного треку переходимо до наступного
-        coro = play_next_song(interaction, player)
-        asyncio.run_coroutine_threadsafe(coro, bot.loop)
-
-    player.voice_client.play(source, after=after_playing)
-
-    # Надсилаємо повідомлення про поточну пісню
-    await interaction.followup.send(
-        f"Зараз грає: **{player.current_song.title}** "
-        f"(тривалість: {player.current_song.duration_str()})\n"
-        f"Джерело: {player.current_song.webpage_url}"
+    src = discord.FFmpegPCMAudio(
+        player.current.source_url,
+        before_options="-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
+        options="-vn",
     )
 
+    def after(err):
+        if err:
+            print("⚠️ FFmpeg error:", err)
+        asyncio.run_coroutine_threadsafe(_after_song(player, inter), bot.loop)
 
-async def play_next_song(interaction: discord.Interaction, player: MusicPlayer):
-    if len(player.queue) == 0:
-        # Пісень більше немає
-        player.current_song = None
-        return
+    player.voice.play(src, after=after)
+
+
+async def _after_song(player: MusicPlayer, inter: discord.Interaction):
+    player.next()
+    if player.current:
+        await _start_playback(player, inter)
     else:
-        # Беремо наступну з черги
-        player.current_song = player.queue.pop(0)
-        await start_playing(interaction, player)
+        await asyncio.sleep(30)  # таймер авто‑відключення
+        if player.voice and not player.voice.is_playing():
+            await player.voice.disconnect()
 
 
-@bot.tree.command(name="skip", description="Пропустити поточний трек і відтворити наступний.")
-async def skip_command(interaction: discord.Interaction):
-    guild_id = interaction.guild_id
-    player = get_player(guild_id)
-
-    if not player.voice_client or not player.voice_client.is_playing():
-        await interaction.response.send_message("Наразі нічого не грає.", ephemeral=True)
-        return
-
-    player.skip_song()
-    await interaction.response.send_message("Поточний трек пропущено!")
-
-
-@bot.tree.command(name="pause", description="Поставити на паузу або відновити відтворення.")
-async def pause_command(interaction: discord.Interaction):
-    guild_id = interaction.guild_id
-    player = get_player(guild_id)
-
-    if not player.voice_client or (not player.voice_client.is_playing() and not player.is_paused):
-        await interaction.response.send_message("Зараз нічого не грає.", ephemeral=True)
-        return
-
-    player.pause()
-    if player.is_paused:
-        await interaction.response.send_message("Відтворення поставлено на паузу.")
+@app_commands.command(description="Пропустити поточний трек")
+async def skip(inter: discord.Interaction):
+    player = get_player(inter.guild)
+    if player.voice and player.voice.is_playing():
+        player.voice.stop()
+        await inter.response.send_message("⏭️ Трек пропущено", ephemeral=True)
     else:
-        await interaction.response.send_message("Відтворення продовжено.")
+        await inter.response.send_message("Зараз нічого не грає", ephemeral=True)
 
 
-@bot.tree.command(name="stop", description="Зупинити відтворення та вийти з голосового каналу.")
-async def stop_command(interaction: discord.Interaction):
-    guild_id = interaction.guild_id
-    player = get_player(guild_id)
+@app_commands.command(description="Пауза / відновлення")
+async def pause(inter: discord.Interaction):
+    player = get_player(inter.guild)
+    if not player.voice:
+        return await inter.response.send_message("Бот не в голосовому каналі", ephemeral=True)
 
-    if not player.voice_client or not player.voice_client.is_connected():
-        await interaction.response.send_message("Бот не в голосовому каналі.", ephemeral=True)
-        return
-
-    player.stop()
-    await interaction.response.send_message("Бот вийшов з голосового каналу та зупинив відтворення.")
-
-
-@bot.tree.command(name="queue", description="Показати поточну чергу відтворення.")
-async def queue_command(interaction: discord.Interaction):
-    guild_id = interaction.guild_id
-    player = get_player(guild_id)
-
-    if player.current_song:
-        now_playing = f"**Зараз грає:** {player.current_song.title}\n\n"
+    if player.voice.is_playing():
+        player.voice.pause()
+        player.is_paused = True
+        await inter.response.send_message("⏸️ Пауза", ephemeral=True)
+    elif player.is_paused:
+        player.voice.resume()
+        player.is_paused = False
+        await inter.response.send_message("▶️ Продовжуємо", ephemeral=True)
     else:
-        now_playing = "**Зараз не грає жодна пісня.**\n\n"
+        await inter.response.send_message("Немає чого ставити на паузу", ephemeral=True)
 
-    if len(player.queue) == 0:
-        queue_str = "Черга порожня."
+
+@app_commands.command(description="Зупинити та вийти з каналу")
+async def stop(inter: discord.Interaction):
+    player = get_player(inter.guild)
+    player.queue.clear()
+    player.current = None
+    player.disconnect()
+    await inter.response.send_message("⏹️ Відтворення зупинено і бот покинув канал", ephemeral=True)
+
+
+@app_commands.command(description="Показати чергу")
+async def queue(inter: discord.Interaction):
+    player = get_player(inter.guild)
+    desc = [f"**Зараз грає:** {player.current}" if player.current else "**Нічого не грає**"]
+
+    if player.queue:
+        desc.append("\n**Черга:**")
+        desc += [f"{i+1}. {s}" for i, s in enumerate(player.queue)]
     else:
-        queue_str = "Черга:\n"
-        for i, song in enumerate(player.queue):
-            queue_str += f"{i} — {song.title} ({song.duration_str()})\n"
+        desc.append("\nЧерга порожня.")
 
-    await interaction.response.send_message(now_playing + queue_str)
+    await inter.response.send_message("\n".join(desc), ephemeral=True)
 
 
-@bot.tree.command(name="remove", description="Видалити пісню з черги за номером.")
-@app_commands.describe(index="Номер пісні в черзі (0, 1, 2...).")
-async def remove_command(interaction: discord.Interaction, index: int):
-    guild_id = interaction.guild_id
-    player = get_player(guild_id)
-
-    if len(player.queue) == 0:
-        await interaction.response.send_message("Черга порожня, нема що видаляти.", ephemeral=True)
-        return
-    
-    removed = player.remove_song(index)
-    if removed:
-        await interaction.response.send_message(f"Пісню під індексом {index} видалено з черги.")
+@app_commands.command(description="Видалити трек із черги")
+@app_commands.describe(index="Номер у черзі, починаючи з 1")
+async def remove(inter: discord.Interaction, index: int):
+    player = get_player(inter.guild)
+    if 1 <= index <= len(player.queue):
+        song = player.queue.pop(index - 1)
+        await inter.response.send_message(f"🗑️ Видалено: **{song.title}**", ephemeral=True)
     else:
-        await interaction.response.send_message(f"Пісні з індексом {index} в черзі не існує.", ephemeral=True)
+        await inter.response.send_message("❌ Неправильний індекс", ephemeral=True)
 
 
-# Запуск бота
-# Токен можна зберігати у змінній середовища DISCORD_BOT_TOKEN (в налаштуваннях Render, наприклад)
+# ╭─╴ Обробка виключень ───────────────────────────────────────╮
+@bot.tree.error
+async def on_app_error(inter: discord.Interaction, error: app_commands.AppCommandError):
+    original = getattr(error, "original", error)
+    traceback.print_exception(type(original), original, original.__traceback__)
+    if inter.response.is_done():
+        await inter.followup.send(f"⚠️ Помилка: {original}", ephemeral=True)
+    else:
+        await inter.response.send_message(f"⚠️ Помилка: {original}", ephemeral=True)
+
+
+# ╭─╴ Запуск ───────────────────────────────────────────────────╮
 if __name__ == "__main__":
-    TOKEN = os.getenv("DISCORD_BOT_TOKEN")
-    if not TOKEN:
-        print("Не вказано токен бота. Задайте DISCORD_BOT_TOKEN у змінних середовища.")
-    else:
-        bot.run(TOKEN)
+    token = os.getenv("DISCORD_BOT_TOKEN")
+    if not token:
+        raise RuntimeError("Не знайдено DISCORD_BOT_TOKEN у змінних середовища!")
+    bot.run(token)
