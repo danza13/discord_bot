@@ -1,0 +1,14 @@
+services:
+  - type: worker                # фонова служба
+    name: discord-music-bot
+    env: python
+    plan: starter               # free tier не підтримує worker
+    buildCommand: |
+      apt-get update && apt-get install -y ffmpeg   # додаємо FFmpeg
+      pip install -r requirements.txt
+    startCommand: python main.py
+    envVars:
+      - key: DISCORD_BOT_TOKEN
+        sync: false             # додасте значення у Dashboard
+      - key: DISCORD_APP_ID     # не обовʼязково для py‑cord
+        sync: false
