@@ -6,3 +6,4 @@ youtube-dl
 asyncio
 ffmpeg
 PyNaCl
+async_timeout
