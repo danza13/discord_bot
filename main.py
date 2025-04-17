@@ -1,6 +1,7 @@
 # ------------ main.py ------------
 import os
 import discord
+from discord.ext import commands
 from aiohttp import web
 
 # 1. Зчитуємо токен зі змінної середовища
@@ -8,12 +9,12 @@ TOKEN = os.getenv('DISCORD_TOKEN')
 if not TOKEN:
     raise RuntimeError("DISCORD_TOKEN не встановлений у середовищі!")
 
-# 2. Налаштовуємо Intents
+# 2. Інтенси для команд і повідомлень
 intents = discord.Intents.default()
-intents.message_content = True   # щоб працювало on_message
-intents.guilds = True            # щоб бот бачив сервери
+intents.message_content = True
+intents.guilds = True
 
-# 3. HTTP‑сервер для Render
+# 3. Простий HTTP‑сервер для Render
 async def start_http_server():
     app = web.Application()
     app.add_routes([web.get('/', lambda req: web.Response(text="OK"))])
@@ -23,21 +24,21 @@ async def start_http_server():
     site = web.TCPSite(runner, '0.0.0.0', port)
     await site.start()
 
-# 4. Визначаємо клієнта Discord
-class MyClient(discord.Client):
+# 4. Створюємо клас бота на основі commands.Bot
+class MusicBot(commands.Bot):
+    def __init__(self):
+        super().__init__(command_prefix='#', intents=intents)
+
     async def setup_hook(self):
-        # Запускаємо HTTP‑сервер паралельно з ботом
+        # а) запускаємо HTTP‑сервер паралельно
         self.loop.create_task(start_http_server())
+        # б) підключаємо Cog з музикою
+        from music_rus import Music
+        await self.add_cog(Music(self))
 
     async def on_ready(self):
-        print(f'Logged on as {self.user}!')
+        print(f'✅ Logged in as {self.user} (ID: {self.user.id})')
 
-    async def on_message(self, message):
-        # Щоб бот не реагував на власні повідомлення
-        if message.author == self.user:
-            return
-        print(f'Message from {message.author}: {message.content}')
-
-# 5. Створюємо та запускаємо клієнта
-client = MyClient(intents=intents)
-client.run(TOKEN)
+# 5. Інстансуємо й запускаємо
+bot = MusicBot()
+bot.run(TOKEN)
