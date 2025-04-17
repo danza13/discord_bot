@@ -2,7 +2,7 @@ discord.py[voice]
 aiohttp
 websockets
 chardet
-youtube-dl
+yt-dlp
 asyncio
 ffmpeg
 PyNaCl
