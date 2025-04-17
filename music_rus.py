@@ -27,8 +27,7 @@ class YTDLSource(discord.PCMVolumeTransformer):
         'no_warnings': True,
         'default_search': 'auto',
         'source_address': '0.0.0.0',
-        # якщо потрібно підтримати cookies-файл (для відео з капчею):
-        # 'cookiefile': 'cookies.txt',
+        'cookiefile': 'cookies.txt',
     }
     FFMPEG_OPTIONS = {
         'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5',
