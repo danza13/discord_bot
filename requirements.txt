@@ -1,7 +1,8 @@
-discord.py
+discord.py[voice]
 aiohttp
 websockets
 chardet
 youtube-dl
 asyncio
 ffmpeg
+PyNaCl
