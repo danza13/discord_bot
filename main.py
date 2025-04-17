@@ -35,6 +35,8 @@ class MusicBot(commands.Bot):
         # б) підключаємо Cog з музикою
         from music_rus import Music
         await self.add_cog(Music(self))
+        # в) синхронізуємо слеш‑команди
+        await self.tree.sync()
 
     async def on_ready(self):
         print(f'✅ Logged in as {self.user} (ID: {self.user.id})')
