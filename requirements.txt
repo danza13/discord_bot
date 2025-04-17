@@ -3,7 +3,6 @@ aiohttp
 websockets
 chardet
 yt-dlp
-asyncio
-ffmpeg
-PyNaCl
 async_timeout
+PyNaCl
+ffmpeg
