@@ -1,1 +1,1 @@
-worker: python music_rus.py
+web: python main.py
