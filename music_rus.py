@@ -220,17 +220,23 @@ class Music(commands.Cog):
     @app_commands.describe(query="URL або пошуковий запит")
     async def play(self, interaction: discord.Interaction, query: str):
         state = self.get_voice_state(interaction)
+
+        # Якщо бот ще не підключений до голосу — підключаємося на місці
         if not state.voice:
-            await self.join(interaction)
+            if not interaction.user.voice or not interaction.user.voice.channel:
+                await interaction.response.send_message("Спочатку підключіться до голосового каналу.", ephemeral=True)
+                return
+            channel = interaction.user.voice.channel
+            state.voice = await channel.connect()
 
         await interaction.response.defer()
         try:
-            source = await YTDLSource.create_source(interaction, query)
+            source = await YTDLSource.create_source(interaction, query, loop=self.bot.loop)
             song = Song(source)
             await state.songs.put(song)
             await interaction.followup.send(f"Додано до черги: **{source.title}**")
         except YTDLError as e:
-            await interaction.followup.send(f"❌ Помилка: {e}")
+            await interaction.followup.send(f"Помилка: {e}")
 
     @app_commands.command(name="skip", description="Пропустити поточний трек")
     async def skip(self, interaction: discord.Interaction):
