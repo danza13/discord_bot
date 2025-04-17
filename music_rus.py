@@ -8,6 +8,7 @@ import yt_dlp as youtube_dl
 from async_timeout import timeout
 from discord import app_commands
 from discord.ext import commands
+from typing import Union
 
 # Приглушуємо повідомлення про баги в yt-dlp
 youtube_dl.utils.bug_reports_message = lambda: ''
@@ -36,9 +37,18 @@ class YTDLSource(discord.PCMVolumeTransformer):
 
     ytdl = youtube_dl.YoutubeDL(YTDL_OPTIONS)
 
-    def __init__(self, ctx: commands.Context, source: discord.FFmpegPCMAudio, *, data: dict, volume: float = 0.5):
+    def __init__(
+        self,
+        ctx: Union[commands.Context, discord.Interaction],
+        source: discord.FFmpegPCMAudio,
+        *,
+        data: dict,
+        volume: float = 0.5
+    ):
         super().__init__(source, volume)
-        self.requester = ctx.author
+        # Визначаємо, хто запросив (author для text ctx, user для slash)
+        self.requester = getattr(ctx, 'author', None) or getattr(ctx, 'user', None)
+        # Канал для відправки embed
         self.channel = ctx.channel
         self.data = data
 
@@ -64,9 +74,14 @@ class YTDLSource(discord.PCMVolumeTransformer):
         return f"**{self.title}** від **{self.uploader}**"
 
     @classmethod
-    async def create_source(cls, ctx: commands.Context, search: str, *, loop: asyncio.BaseEventLoop = None):
+    async def create_source(
+        cls,
+        ctx: Union[commands.Context, discord.Interaction],
+        search: str,
+        *,
+        loop: asyncio.BaseEventLoop = None
+    ):
         loop = loop or asyncio.get_event_loop()
-        # Завантажуємо інформацію (оброблена) одразу
         data = await loop.run_in_executor(
             None,
             lambda: cls.ytdl.extract_info(search, download=False)
@@ -74,17 +89,14 @@ class YTDLSource(discord.PCMVolumeTransformer):
         if data is None:
             raise YTDLError(f"Не знайдено результатів за запитом `{search}`")
 
-        # Якщо це плейлист/пошук — беремо перший релевантний відео-результат
         if 'entries' in data:
             entries = [e for e in data['entries'] if e]
             if not entries:
                 raise YTDLError(f"Не знайдено результатів за запитом `{search}`")
             data = entries[0]
 
-        # Дістаємо безпосередній URL аудіопотоку
         url = data.get('url')
         if not url:
-            # іноді треба повторно викликати на посилання на сторінку
             webpage_url = data.get('webpage_url')
             processed = await loop.run_in_executor(
                 None,
@@ -96,7 +108,6 @@ class YTDLSource(discord.PCMVolumeTransformer):
             if not url:
                 raise YTDLError("Не вдалося отримати пряме посилання на аудіо.")
 
-        # Створюємо PCM-джерело через FFmpeg
         ffmpeg_source = discord.FFmpegPCMAudio(url, **cls.FFMPEG_OPTIONS)
         return cls(ctx, ffmpeg_source, data=data)
 
@@ -106,14 +117,19 @@ class YTDLSource(discord.PCMVolumeTransformer):
         hours, minutes = divmod(minutes, 60)
         days, hours = divmod(hours, 24)
         parts = []
-        if days: parts.append(f"{days} дн.")
-        if hours: parts.append(f"{hours} год.")
-        if minutes: parts.append(f"{minutes} хв.")
-        if seconds: parts.append(f"{seconds} сек.")
+        if days:
+            parts.append(f"{days} дн.")
+        if hours:
+            parts.append(f"{hours} год.")
+        if minutes:
+            parts.append(f"{minutes} хв.")
+        if seconds:
+            parts.append(f"{seconds} сек.")
         return ', '.join(parts) or "0 сек."
 
 class Song:
     __slots__ = ('source', 'requester')
+
     def __init__(self, source: YTDLSource):
         self.source = source
         self.requester = source.requester
@@ -133,19 +149,24 @@ class Song:
 class SongQueue(asyncio.Queue):
     def __getitem__(self, item):
         if isinstance(item, slice):
-            return list(itertools.islice(self._queue, item.start or 0, item.stop))
+            return list(itertools.islice(
+                self._queue, item.start or 0, item.stop))
         return self._queue[item]
+
     def __len__(self):
         return self.qsize()
+
     def clear(self):
         self._queue.clear()
+
     def shuffle(self):
         random.shuffle(self._queue)
+
     def remove(self, index: int):
         del self._queue[index]
 
 class VoiceState:
-    def __init__(self, bot: commands.Bot, ctx: commands.Context):
+    def __init__(self, bot: commands.Bot, ctx: Union[commands.Context, discord.Interaction]):
         self.bot = bot
         self._ctx = ctx
         self.voice = None
@@ -167,8 +188,6 @@ class VoiceState:
     async def player_loop(self):
         while True:
             self.next.clear()
-
-            # Якщо не зациклюємо, чекаємо нової пісні
             if not self.loop:
                 try:
                     async with timeout(180.0):
@@ -176,11 +195,9 @@ class VoiceState:
                 except asyncio.TimeoutError:
                     return await self.stop()
 
-            # Відтворюємо
             self.current.source.volume = self.volume
             self.voice.play(self.current.source, after=lambda e: self.next.set())
             await self.current.source.channel.send(embed=self.current.create_embed())
-
             await self.next.wait()
 
     async def stop(self):
@@ -193,7 +210,7 @@ class Music(commands.Cog):
     """Cog для відтворення музики через slash-команди"""
     def __init__(self, bot: commands.Bot):
         self.bot = bot
-        self.voice_states = {}
+        self.voice_states: dict[int, VoiceState] = {}
 
     def get_voice_state(self, interaction: discord.Interaction) -> VoiceState:
         gid = interaction.guild.id if interaction.guild else None
@@ -206,7 +223,9 @@ class Music(commands.Cog):
     @app_commands.command(name="join", description="Приєднати бота до вашого голосового каналу")
     async def join(self, interaction: discord.Interaction):
         if not interaction.user.voice or not interaction.user.voice.channel:
-            await interaction.response.send_message("Спочатку підключіться до голосового каналу.", ephemeral=True)
+            await interaction.response.send_message(
+                "Спочатку підключіться до голосового каналу.", ephemeral=True
+            )
             return
         channel = interaction.user.voice.channel
         state = self.get_voice_state(interaction)
@@ -221,10 +240,11 @@ class Music(commands.Cog):
     async def play(self, interaction: discord.Interaction, query: str):
         state = self.get_voice_state(interaction)
 
-        # Якщо бот ще не підключений до голосу — підключаємося на місці
         if not state.voice:
             if not interaction.user.voice or not interaction.user.voice.channel:
-                await interaction.response.send_message("Спочатку підключіться до голосового каналу.", ephemeral=True)
+                await interaction.response.send_message(
+                    "Спочатку підключіться до голосового каналу.", ephemeral=True
+                )
                 return
             channel = interaction.user.voice.channel
             state.voice = await channel.connect()
